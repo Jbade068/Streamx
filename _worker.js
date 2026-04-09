@@ -76,16 +76,25 @@ async function handleAPI(request, url) {
   // /api/hls
   if (path === "/api/hls") {
     const streamUrl = url.searchParams.get("url");
-    const clientBase = url.searchParams.get("base") || `${url.protocol}//${url.host}`;
     if (!streamUrl) return new Response("Missing url", { status: 400, headers: corsHeaders() });
+
+    // Derive proxy prefix from THIS request's URL — works on any domain (Cloudflare, Perplexity, localhost)
+    // Use the clientBase param if provided, otherwise derive from the request origin
+    const clientBase = url.searchParams.get("base");
+    const proxyPrefix = (clientBase && clientBase.length > 1)
+      ? clientBase.replace(/\/$/, "")
+      : `${url.protocol}//${url.host}`;  // e.g. https://streamx-iptv.pages.dev
+
     let r = null, lastStatus = 0;
     for (const ua of UAS) {
       try {
         let origin = "";
         try { origin = new URL(streamUrl).origin; } catch {}
         const attempt = await fetch(streamUrl, {
-          headers: { "User-Agent": ua, "Accept": "*/*",
-            ...(origin ? { "Referer": origin + "/", "Origin": origin } : {}) },
+          headers: {
+            "User-Agent": ua, "Accept": "*/*",
+            ...(origin ? { "Referer": origin + "/", "Origin": origin } : {}),
+          },
           redirect: "follow",
         });
         lastStatus = attempt.status;
@@ -96,20 +105,25 @@ async function handleAPI(request, url) {
         return new Response(`Stream error ${attempt.status}`, { status: attempt.status, headers: corsHeaders() });
       } catch { continue; }
     }
-    if (!r) return new Response(lastStatus === 403 ? "CDN access denied" : "Stream fetch failed",
-      { status: lastStatus || 503, headers: corsHeaders() });
+
+    if (!r) return new Response(
+      lastStatus === 403 ? "CDN access denied" : "Stream fetch failed",
+      { status: lastStatus || 503, headers: corsHeaders() }
+    );
+
     const finalUrl = r.url || streamUrl;
     const text = await r.text();
-    const proxy = clientBase.replace(/\/$/, "");
+
     const rewritten = text.split("\n").map(line => {
       const t = line.trim();
       if (!t || t.startsWith("#")) return line;
       const abs = resolveUrl(finalUrl, t);
       const p2 = abs.split("?")[0].split("#")[0];
       if (p2.endsWith(".m3u8") || p2.endsWith(".M3U8"))
-        return `${proxy}/api/hls?url=${encodeURIComponent(abs)}&base=${encodeURIComponent(proxy)}`;
-      return `${proxy}/api/seg?url=${encodeURIComponent(abs)}`;
+        return `${proxyPrefix}/api/hls?url=${encodeURIComponent(abs)}&base=${encodeURIComponent(proxyPrefix)}`;
+      return `${proxyPrefix}/api/seg?url=${encodeURIComponent(abs)}`;
     }).join("\n");
+
     return new Response(rewritten, {
       headers: { ...corsHeaders(), "Content-Type": "application/vnd.apple.mpegurl" }
     });
@@ -124,9 +138,11 @@ async function handleAPI(request, url) {
       try { origin = new URL(segUrl).origin; } catch {}
       const range = request.headers.get("Range");
       const r = await fetch(segUrl, {
-        headers: { "User-Agent": PLAYER_UA, "Accept": "*/*",
+        headers: {
+          "User-Agent": PLAYER_UA, "Accept": "*/*",
           ...(origin ? { "Referer": origin + "/", "Origin": origin } : {}),
-          ...(range ? { "Range": range } : {}) },
+          ...(range ? { "Range": range } : {}),
+        },
         redirect: "follow",
       });
       const h = new Headers(corsHeaders());
@@ -146,8 +162,10 @@ async function handleAPI(request, url) {
     try {
       const range = request.headers.get("Range");
       const r = await fetch(vodUrl, {
-        headers: { "User-Agent": PLAYER_UA, "Accept": "*/*",
-          ...(range ? { "Range": range } : {}) },
+        headers: {
+          "User-Agent": PLAYER_UA, "Accept": "*/*",
+          ...(range ? { "Range": range } : {}),
+        },
         redirect: "follow",
       });
       if (!r.ok && r.status !== 206)
@@ -165,13 +183,9 @@ async function handleAPI(request, url) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-
-    // Route /api/* to worker logic
     if (url.pathname.startsWith("/api/")) {
       return handleAPI(request, url);
     }
-
-    // Everything else — serve static assets from Pages
     return env.ASSETS.fetch(request);
   }
 };
